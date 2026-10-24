@@ -4,7 +4,8 @@
 -- Coins:    workspace > MapEssentials > Spawned > Number (MeshPart, positioned with CFrame)
 -- Region:   workspace > MapEssentials > Collection > SpawnableRegion (set to 100, 20, 100 while Auto collect is on)
 -- Challenge: ReplicatedStorage > Remotes > Challenge:FireServer("CoinCollector", "Start") (spammed every 100ms)
--- Droppers: ReplicatedStorage > Remotes > DropperClick / BronzeDropperClick :FireServer()
+-- Auto Click remotes (all :FireServer() with no args), in ReplicatedStorage > Remotes:
+--   DropperClick, BronzeDropperClick, MobAttackMlt (Auto Fighting), TreeHit (Auto Logging)
 -- Game behavior while reeling: hold = zone moves RIGHT, release = zone moves LEFT
 
 local Players = game:GetService("Players")
@@ -70,11 +71,13 @@ local regionRef = nil
 local regionOrigSize = nil
 local regionWarned = false
 
--- auto click (droppers)
+-- auto click (remote spam loops)
 local clickInterval = 0.1
 local clickLoops = {
 	DropperClick = { on = false, id = 0, warned = false },
 	BronzeDropperClick = { on = false, id = 0, warned = false },
+	MobAttackMlt = { on = false, id = 0, warned = false },
+	TreeHit = { on = false, id = 0, warned = false },
 }
 
 local function dbg(...)
@@ -218,7 +221,7 @@ local function holdLogic(now)
 	end
 end
 
--- ===== auto click (droppers) =====
+-- ===== auto click (remote spam loops) =====
 
 local function getRemote(name)
 	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
@@ -583,8 +586,9 @@ local function cleanup()
 	challengeOn = false
 	stopCollect()
 	stopChallengeLoop()
-	stopClickLoop("DropperClick")
-	stopClickLoop("BronzeDropperClick")
+	for name in pairs(clickLoops) do
+		stopClickLoop(name)
+	end
 	if conn then
 		conn:Disconnect()
 		conn = nil
@@ -628,6 +632,32 @@ ClickTab:CreateToggle({
 			startClickLoop("BronzeDropperClick")
 		else
 			stopClickLoop("BronzeDropperClick")
+		end
+	end,
+})
+
+ClickTab:CreateToggle({
+	Name = "Auto Fighting",
+	CurrentValue = false,
+	Flag = "AutoFighting",
+	Callback = function(value)
+		if value then
+			startClickLoop("MobAttackMlt")
+		else
+			stopClickLoop("MobAttackMlt")
+		end
+	end,
+})
+
+ClickTab:CreateToggle({
+	Name = "Auto Logging",
+	CurrentValue = false,
+	Flag = "AutoLogging",
+	Callback = function(value)
+		if value then
+			startClickLoop("TreeHit")
+		else
+			stopClickLoop("TreeHit")
 		end
 	end,
 })
