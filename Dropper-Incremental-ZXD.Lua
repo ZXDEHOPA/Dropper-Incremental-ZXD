@@ -1,10 +1,12 @@
--- Reel Helper (Rayfield): Auto hold + Coins (pull to me)
+-- Reel Helper (Rayfield): Auto hold + Coins (pull to me) + Coin Challenge start
 -- Reel GUI: PlayerGui > Front > MainFrame > ReelBar > Track > Lane > (Zone, Fish)
 -- Coins:    workspace > MapEssentials > Spawned > Number (MeshPart, positioned with CFrame)
+-- Challenge: ReplicatedStorage > Remotes > Challenge:FireServer("CoinCollector", "Start")
 -- Game behavior while reeling: hold = zone moves RIGHT, release = zone moves LEFT
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 
 local okVIM, VIM = pcall(function()
@@ -37,6 +39,7 @@ local TOUCH_ID = 1
 -- coins
 local collectOn = false
 local returnOn = true
+local autoStartChallenge = false
 local coinMethod = "Pull" -- "Pull", "Teleport" or "Touch"
 local delaySec = 0.15
 local pullInterval = 0.1
@@ -188,6 +191,28 @@ local function holdLogic(now)
 		lastDbg = now
 		print(string.format("[ReelHelper] fish %.0f | zone %.0f | err %.0f | holding %s", fishC, zoneC, err, tostring(holding)))
 	end
+end
+
+-- ===== coin challenge =====
+
+local function startChallenge()
+	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	local ev = remotes and remotes:FindFirstChild("Challenge")
+	if not ev or not ev:IsA("RemoteEvent") then
+		warn("[ReelHelper] couldn't find ReplicatedStorage.Remotes.Challenge")
+		return false
+	end
+
+	local ok, err = pcall(function()
+		ev:FireServer("CoinCollector", "Start")
+	end)
+
+	if ok then
+		print("[ReelHelper] sent CoinCollector Start")
+	else
+		warn("[ReelHelper] challenge start failed:", err)
+	end
+	return ok
 end
 
 -- ===== coins =====
@@ -472,6 +497,13 @@ FishTab:CreateToggle({
 
 local CoinTab = Window:CreateTab("Coins", 4483362458)
 
+CoinTab:CreateButton({
+	Name = "Start Coin Challenge",
+	Callback = function()
+		startChallenge()
+	end,
+})
+
 CoinTab:CreateToggle({
 	Name = "Auto collect coins",
 	CurrentValue = false,
@@ -479,10 +511,22 @@ CoinTab:CreateToggle({
 	Callback = function(value)
 		collectOn = value
 		if value then
+			if autoStartChallenge then
+				startChallenge()
+			end
 			startCollect()
 		else
 			stopCollect()
 		end
+	end,
+})
+
+CoinTab:CreateToggle({
+	Name = "Start challenge when auto collect turns on",
+	CurrentValue = false,
+	Flag = "AutoStartChallenge",
+	Callback = function(value)
+		autoStartChallenge = value
 	end,
 })
 
