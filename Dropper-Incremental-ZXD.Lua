@@ -1,8 +1,10 @@
--- Reel Helper (Rayfield): Auto Fish + Coins (region resize / pull) + Auto Challenge Coin
+-- Reel Helper (Rayfield): Auto Click + Coins + Auto Fish
+-- Tabs: Auto Click, Coins, Fishing, Settings
 -- Reel GUI: PlayerGui > Front > MainFrame > ReelBar > Track > Lane > (Zone, Fish)
 -- Coins:    workspace > MapEssentials > Spawned > Number (MeshPart, positioned with CFrame)
 -- Region:   workspace > MapEssentials > Collection > SpawnableRegion (set to 100, 20, 100 while Auto collect is on)
 -- Challenge: ReplicatedStorage > Remotes > Challenge:FireServer("CoinCollector", "Start") (spammed every 100ms)
+-- Droppers: ReplicatedStorage > Remotes > DropperClick / BronzeDropperClick :FireServer()
 -- Game behavior while reeling: hold = zone moves RIGHT, release = zone moves LEFT
 
 local Players = game:GetService("Players")
@@ -67,6 +69,13 @@ local challengeWarned = false
 local regionRef = nil
 local regionOrigSize = nil
 local regionWarned = false
+
+-- auto click (droppers)
+local clickInterval = 0.1
+local clickLoops = {
+	DropperClick = { on = false, id = 0, warned = false },
+	BronzeDropperClick = { on = false, id = 0, warned = false },
+}
 
 local function dbg(...)
 	if debugOn then
@@ -207,6 +216,67 @@ local function holdLogic(now)
 		lastDbg = now
 		print(string.format("[ReelHelper] fish %.0f | zone %.0f | err %.0f | holding %s", fishC, zoneC, err, tostring(holding)))
 	end
+end
+
+-- ===== auto click (droppers) =====
+
+local function getRemote(name)
+	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	local ev = remotes and remotes:FindFirstChild(name)
+	if ev and ev:IsA("RemoteEvent") then
+		return ev
+	end
+	return nil
+end
+
+local function startClickLoop(name)
+	local st = clickLoops[name]
+	if not st then
+		return
+	end
+
+	st.on = true
+	st.id += 1
+	local myId = st.id
+
+	task.spawn(function()
+		local ev = nil
+
+		while alive and st.on and st.id == myId do
+			if not ev or not ev.Parent then
+				ev = getRemote(name)
+			end
+
+			if ev then
+				local ok, err = pcall(function()
+					ev:FireServer()
+				end)
+				if ok then
+					st.warned = false
+				elseif not st.warned then
+					st.warned = true
+					warn("[ReelHelper] " .. name .. " failed:", err)
+				end
+			elseif not st.warned then
+				st.warned = true
+				warn("[ReelHelper] couldn't find ReplicatedStorage.Remotes." .. name)
+			end
+
+			task.wait(clickInterval)
+		end
+	end)
+
+	dbg(name, "loop started")
+end
+
+local function stopClickLoop(name)
+	local st = clickLoops[name]
+	if not st then
+		return
+	end
+	st.on = false
+	st.id += 1 -- ends any running loop for this remote
+	dbg(name, "loop stopped")
 end
 
 -- ===== challenge spam =====
@@ -513,6 +583,8 @@ local function cleanup()
 	challengeOn = false
 	stopCollect()
 	stopChallengeLoop()
+	stopClickLoop("DropperClick")
+	stopClickLoop("BronzeDropperClick")
 	if conn then
 		conn:Disconnect()
 		conn = nil
@@ -526,57 +598,53 @@ end
 local Window = Rayfield:CreateWindow({
 	Name = "Reel Helper",
 	LoadingTitle = "Reel Helper",
-	LoadingSubtitle = "auto fish + coins",
+	LoadingSubtitle = "auto click + coins + auto fish",
 	ConfigurationSaving = { Enabled = false },
 	KeySystem = false,
 })
 
--- Fishing tab
-local FishTab = Window:CreateTab("Fishing", 4483362458)
+-- Tab 1: Auto Click
+local ClickTab = Window:CreateTab("Auto Click", 4483362458)
 
-FishTab:CreateToggle({
-	Name = "Auto Fish",
+ClickTab:CreateToggle({
+	Name = "Auto Dropper",
 	CurrentValue = false,
-	Flag = "AutoFish",
+	Flag = "AutoDropper",
 	Callback = function(value)
-		autoOn = value
-		if not value then
-			setHold(false)
-		end
-		dbg("auto fish:", value)
-	end,
-})
-
-FishTab:CreateDropdown({
-	Name = "Input method",
-	Options = { "Touch", "Mouse" },
-	CurrentOption = { "Touch" },
-	MultipleOptions = false,
-	Flag = "InputMethod",
-	Callback = function(option)
-		local v = type(option) == "table" and option[1] or option
-		if v == "Mouse" or v == "Touch" then
-			setHold(false)
-			inputMethod = v
-			inputBroken = false
-			dbg("input method:", v)
+		if value then
+			startClickLoop("DropperClick")
+		else
+			stopClickLoop("DropperClick")
 		end
 	end,
 })
 
-FishTab:CreateSlider({
-	Name = "Deadband (px)",
-	Range = { 0, 60 },
-	Increment = 1,
-	Suffix = "px",
-	CurrentValue = 12,
-	Flag = "Deadband",
+ClickTab:CreateToggle({
+	Name = "Auto Bronze Dropper",
+	CurrentValue = false,
+	Flag = "AutoBronzeDropper",
 	Callback = function(value)
-		deadband = value
+		if value then
+			startClickLoop("BronzeDropperClick")
+		else
+			stopClickLoop("BronzeDropperClick")
+		end
 	end,
 })
 
--- Coins tab
+ClickTab:CreateSlider({
+	Name = "Click delay (s)",
+	Range = { 0.03, 1 },
+	Increment = 0.01,
+	Suffix = "s",
+	CurrentValue = 0.1,
+	Flag = "ClickDelay",
+	Callback = function(value)
+		clickInterval = value
+	end,
+})
+
+-- Tab 2: Coins
 local CoinTab = Window:CreateTab("Coins", 4483362458)
 
 CoinTab:CreateToggle({
@@ -729,25 +797,38 @@ CoinTab:CreateButton({
 	end,
 })
 
--- Settings tab
-local SettingsTab = Window:CreateTab("Settings", 4483362458)
+-- Tab 3: Fishing (second to last)
+local FishTab = Window:CreateTab("Fishing", 4483362458)
 
-SettingsTab:CreateToggle({
-	Name = "Debug messages (everything)",
+FishTab:CreateToggle({
+	Name = "Auto Fish",
 	CurrentValue = false,
-	Flag = "ReelDebug",
+	Flag = "AutoFish",
 	Callback = function(value)
-		debugOn = value
+		autoOn = value
+		if not value then
+			setHold(false)
+		end
+		dbg("auto fish:", value)
 	end,
 })
 
-SettingsTab:CreateButton({
-	Name = "Unload script",
-	Callback = function()
-		cleanup()
-		Rayfield:Destroy()
+FishTab:CreateDropdown({
+	Name = "Input method",
+	Options = { "Touch", "Mouse" },
+	CurrentOption = { "Touch" },
+	MultipleOptions = false,
+	Flag = "InputMethod",
+	Callback = function(option)
+		local v = type(option) == "table" and option[1] or option
+		if v == "Mouse" or v == "Touch" then
+			setHold(false)
+			inputMethod = v
+			inputBroken = false
+			dbg("input method:", v)
+		end
 	end,
 })
 
--- start the main loop (reel detection, auto fish, region size, coin pulling)
-conn = RunService.Heartbeat:Connect(onHeartbeat)
+FishTab:CreateSlider({
+	Name = "Deadband
