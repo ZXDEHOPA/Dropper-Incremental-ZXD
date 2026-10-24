@@ -1,32 +1,42 @@
--- Reel Helper v3 (Rayfield)
+-- Reel Helper v4: auto-hold to keep the zone on the fish (Rayfield)
 -- GUI path: PlayerGui > Front > MainFrame > ReelBar > Track > Lane > (Zone, Fish)
--- Remote:   ReplicatedStorage > Remotes > Fishing  (args seen: "Cast", "Catch", "Zone", bool)
+-- Remote (spy only): ReplicatedStorage > Remotes > Fishing
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 
+local okVIM, VIM = pcall(function()
+	return game:GetService("VirtualInputManager")
+end)
+if not okVIM then
+	VIM = nil
+end
+
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
-local BIND_NAME = "ZoneFollowFish"
 pcall(function()
-	RunService:UnbindFromRenderStep(BIND_NAME) -- clean up if script was run before
+	RunService:UnbindFromRenderStep("ZoneFollowFish") -- leftover from older versions
 end)
 
 -- state
-local following = false
-local bound = false
+local autoOn = false
 local debugOn = false
 local spyOn = false
-local forceOn = false
+local invert = false -- turn on if holding moves the zone LEFT
+local inputMethod = "Mouse"
+local deadband = 12 -- px
+local ctrlConn = nil
+local holding = false
+local inputBroken = false
 local hookInstalled = false
-local forceConn = nil
-local lastForce = 0
 local lane, zone, fish = nil, nil, nil
 local fishingRemote = nil
 local wasFound = false
 local errWarned = false
+local lastFishX, lastMove, lastDbg = nil, 0, 0
+local TOUCH_ID = 1
 
 local function dbg(...)
 	if debugOn then
@@ -51,6 +61,7 @@ local function resolve()
 	end
 
 	lane, zone, fish = nil, nil, nil
+	lastFishX = nil
 
 	local pg = LocalPlayer:FindFirstChild("PlayerGui")
 	local l = pg and getPath(pg, "Front", "MainFrame", "ReelBar", "Track", "Lane")
@@ -87,7 +98,7 @@ local function getFishingRemote()
 	return nil
 end
 
--- true only if Lane and everything above it is actually visible
+-- true only if the gui and everything above it is actually visible
 local function isShown(gui)
 	local cur = gui
 	while cur do
@@ -102,7 +113,6 @@ local function isShown(gui)
 	return true
 end
 
--- what the GUI says: is the fish center inside the zone?
 local function guiInZone()
 	if not resolve() then
 		return nil
@@ -112,101 +122,113 @@ local function guiInZone()
 	return fishCenter >= zl and fishCenter <= zl + zone.AbsoluteSize.X
 end
 
--- ===== zone follows fish (visual) =====
+-- ===== input (hold / release) =====
 
-local function step()
-	if not resolve() then
-		return
-	end
-
-	local laneW = lane.AbsoluteSize.X
-	if laneW <= 0 then
-		return
-	end
-
-	local zoneW = zone.AbsoluteSize.X
-	local fishCenter = fish.AbsolutePosition.X + fish.AbsoluteSize.X / 2
-
-	local left = fishCenter - zoneW / 2
-	local minLeft = lane.AbsolutePosition.X
-	local maxLeft = math.max(minLeft, minLeft + laneW - zoneW)
-	left = math.clamp(left, minLeft, maxLeft)
-
-	local scaleX = (left + zone.AnchorPoint.X * zoneW - lane.AbsolutePosition.X) / laneW
-
-	zone.Position = UDim2.new(scaleX, 0, zone.Position.Y.Scale, zone.Position.Y.Offset)
+local function tapPos()
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(800, 400)
+	return vp.X * 0.5, vp.Y * 0.4
 end
 
-local function onRender()
-	local ok, err = pcall(step)
+local function setHold(state)
+	if holding == state then
+		return
+	end
+	if inputBroken then
+		return
+	end
+	if not VIM then
+		inputBroken = true
+		warn("[ReelHelper] VirtualInputManager not available in your executor")
+		return
+	end
+
+	local x, y = tapPos()
+	local ok, err = pcall(function()
+		if inputMethod == "Touch" then
+			VIM:SendTouchEvent(TOUCH_ID, state and 0 or 2, x, y)
+		else
+			VIM:SendMouseButtonEvent(x, y, 0, state, game, 0)
+		end
+	end)
+
+	if ok then
+		holding = state
+		dbg(state and "HOLD" or "RELEASE")
+	else
+		inputBroken = true
+		warn("[ReelHelper] input failed (" .. inputMethod .. "):", err)
+		warn("[ReelHelper] try the other input method in the dropdown")
+	end
+end
+
+-- ===== controller =====
+
+local function ctrlStep()
+	if not resolve() or not isShown(lane) or lane.AbsoluteSize.X <= 0 then
+		setHold(false)
+		return
+	end
+
+	local now = os.clock()
+
+	-- only act while the fish is actually moving (so we don't click while idle)
+	local fishX = fish.AbsolutePosition.X
+	if lastFishX == nil or math.abs(fishX - lastFishX) > 0.5 then
+		lastMove = now
+	end
+	lastFishX = fishX
+	if now - lastMove > 0.75 then
+		setHold(false)
+		return
+	end
+
+	local fishC = fishX + fish.AbsoluteSize.X / 2
+	local zoneC = zone.AbsolutePosition.X + zone.AbsoluteSize.X / 2
+	local err = fishC - zoneC
+	if invert then
+		err = -err
+	end
+
+	if err > deadband then
+		setHold(true)
+	elseif err < -deadband then
+		setHold(false)
+	end
+
+	if debugOn and now - lastDbg > 0.5 then
+		lastDbg = now
+		print(string.format("[ReelHelper] fish %.0f | zone %.0f | err %.0f | holding %s", fishC, zoneC, err, tostring(holding)))
+	end
+end
+
+local function onHeartbeat()
+	local ok, err = pcall(ctrlStep)
 	if not ok and not errWarned then
 		errWarned = true
 		warn("[ReelHelper] error:", err)
 	end
 end
 
-local function startFollow()
-	if bound then
+local function startCtrl()
+	if ctrlConn then
 		return
 	end
-	RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Last.Value + 1, onRender)
-	bound = true
-	dbg("follow started")
+	inputBroken = false
+	ctrlConn = RunService.Heartbeat:Connect(onHeartbeat)
+	dbg("auto-hold started")
 end
 
-local function stopFollow()
-	if not bound then
-		return
+local function stopCtrl()
+	if ctrlConn then
+		ctrlConn:Disconnect()
+		ctrlConn = nil
 	end
-	pcall(function()
-		RunService:UnbindFromRenderStep(BIND_NAME)
-	end)
-	bound = false
-	dbg("follow stopped")
+	setHold(false)
+	dbg("auto-hold stopped")
 end
 
--- ===== force "in zone" to the server =====
-
-local function forceStep()
-	local now = os.clock()
-	if now - lastForce < 0.1 then
-		return
-	end
-	lastForce = now
-
-	local remote = getFishingRemote()
-	if not remote or not resolve() or not isShown(lane) then
-		return
-	end
-
-	local ok, err = pcall(function()
-		remote:FireServer("Zone", true)
-	end)
-	if not ok then
-		warn("[ReelHelper] FireServer failed:", err)
-	end
-end
-
-local function startForce()
-	if forceConn then
-		return
-	end
-	if not getFishingRemote() then
-		warn("[ReelHelper] couldn't find ReplicatedStorage.Remotes.Fishing")
-	end
-	forceConn = RunService.Heartbeat:Connect(forceStep)
-	dbg("force in-zone started")
-end
-
-local function stopForce()
-	if forceConn then
-		forceConn:Disconnect()
-		forceConn = nil
-		dbg("force in-zone stopped")
-	end
-end
-
--- ===== fishing remote spy =====
+-- ===== fishing remote spy (finder) =====
 
 local function fmtArgs(...)
 	local packed = table.pack(...)
@@ -257,34 +279,12 @@ local function installSpyHook()
 	return true
 end
 
-local function scanScripts()
-	print("[ReelHelper] ---- scripts scan ----")
-	local roots = {
-		LocalPlayer:FindFirstChild("PlayerGui"),
-		LocalPlayer:FindFirstChild("PlayerScripts"),
-		LocalPlayer:FindFirstChild("Backpack"),
-		LocalPlayer.Character,
-	}
-	local count = 0
-	for _, root in ipairs(roots) do
-		if root then
-			for _, d in ipairs(root:GetDescendants()) do
-				if d:IsA("LocalScript") or d:IsA("ModuleScript") then
-					count += 1
-					print(d.ClassName, d:GetFullName())
-				end
-			end
-		end
-	end
-	print("[ReelHelper] total:", count)
-end
-
 -- ===== UI =====
 
 local Window = Rayfield:CreateWindow({
 	Name = "Reel Helper",
 	LoadingTitle = "Reel Helper",
-	LoadingSubtitle = "zone follows fish",
+	LoadingSubtitle = "auto-hold follows fish",
 	ConfigurationSaving = { Enabled = false },
 	KeySystem = false,
 })
@@ -292,30 +292,54 @@ local Window = Rayfield:CreateWindow({
 local Tab = Window:CreateTab("Reel", 4483362458)
 
 Tab:CreateToggle({
-	Name = "Zone follows fish (visual only)",
+	Name = "Auto-hold (keeps zone on fish)",
 	CurrentValue = false,
-	Flag = "ZoneFollowFish",
+	Flag = "AutoHold",
 	Callback = function(value)
-		following = value
+		autoOn = value
 		if value then
-			startFollow()
+			startCtrl()
 		else
-			stopFollow()
+			stopCtrl()
 		end
 	end,
 })
 
 Tab:CreateToggle({
-	Name = "Force in-zone (sends Zone=true)",
+	Name = "Invert (holding moves zone LEFT)",
 	CurrentValue = false,
-	Flag = "ForceInZone",
+	Flag = "InvertHold",
 	Callback = function(value)
-		forceOn = value
-		if value then
-			startForce()
-		else
-			stopForce()
+		invert = value
+	end,
+})
+
+Tab:CreateDropdown({
+	Name = "Input method",
+	Options = { "Mouse", "Touch" },
+	CurrentOption = { "Mouse" },
+	MultipleOptions = false,
+	Flag = "InputMethod",
+	Callback = function(option)
+		local v = type(option) == "table" and option[1] or option
+		if v == "Mouse" or v == "Touch" then
+			setHold(false)
+			inputMethod = v
+			inputBroken = false
+			dbg("input method:", v)
 		end
+	end,
+})
+
+Tab:CreateSlider({
+	Name = "Deadband (px)",
+	Range = { 0, 60 },
+	Increment = 1,
+	Suffix = "px",
+	CurrentValue = 12,
+	Flag = "Deadband",
+	Callback = function(value)
+		deadband = value
 	end,
 })
 
@@ -353,15 +377,10 @@ FinderTab:CreateToggle({
 })
 
 FinderTab:CreateButton({
-	Name = "Scan scripts",
-	Callback = scanScripts,
-})
-
-FinderTab:CreateButton({
 	Name = "Print status",
 	Callback = function()
 		local found = resolve()
-		print("[ReelHelper] follow:", following, "| force:", forceOn, "| gui found:", found, "| remote:", getFishingRemote() ~= nil)
+		print("[ReelHelper] auto:", autoOn, "| invert:", invert, "| input:", inputMethod, "| broken:", inputBroken, "| gui found:", found)
 		if found then
 			print("Zone:", zone.ClassName, zone.Position, zone.AbsoluteSize)
 			print("Fish:", fish.ClassName, fish.Position, fish.AbsoluteSize)
@@ -373,11 +392,9 @@ FinderTab:CreateButton({
 FinderTab:CreateButton({
 	Name = "Unload script",
 	Callback = function()
-		following = false
-		forceOn = false
+		autoOn = false
 		spyOn = false -- hook can't be removed, but it just passes calls through when off
-		stopFollow()
-		stopForce()
+		stopCtrl()
 		Rayfield:Destroy()
 	end,
 })
