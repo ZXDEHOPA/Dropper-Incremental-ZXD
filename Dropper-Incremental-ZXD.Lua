@@ -831,4 +831,36 @@ FishTab:CreateDropdown({
 })
 
 FishTab:CreateSlider({
-	Name = "Deadband
+	Name = "Deadband (px)",
+	Range = { 0, 60 },
+	Increment = 1,
+	Suffix = "px",
+	CurrentValue = 12,
+	Flag = "Deadband",
+	Callback = function(value)
+		deadband = value
+	end,
+})
+
+-- Tab 4: Settings (last)
+local SettingsTab = Window:CreateTab("Settings", 4483362458)
+
+SettingsTab:CreateToggle({
+	Name = "Debug messages (everything)",
+	CurrentValue = false,
+	Flag = "ReelDebug",
+	Callback = function(value)
+		debugOn = value
+	end,
+})
+
+SettingsTab:CreateButton({
+	Name = "Unload script",
+	Callback = function()
+		cleanup()
+		Rayfield:Destroy()
+	end,
+})
+
+-- start the main loop (reel detection, auto fish, region size, coin pulling)
+conn = RunService.Heartbeat:Connect(onHeartbeat)
