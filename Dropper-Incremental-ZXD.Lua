@@ -1,10 +1,10 @@
--- Reel Helper v4: auto-hold to keep the zone on the fish (Rayfield)
--- GUI path: PlayerGui > Front > MainFrame > ReelBar > Track > Lane > (Zone, Fish)
--- Remote (spy only): ReplicatedStorage > Remotes > Fishing
+-- Reel Helper v6 (Rayfield): Auto hold + Auto cast + Auto hook
+-- Reel GUI: PlayerGui > Front > MainFrame > ReelBar > Track > Lane > (Zone, Fish)
+-- Flow: cast (tap) -> wait for "!" -> hook (tap) -> reel bar -> auto hold
+-- Game behavior while reeling: hold = zone moves RIGHT, release = zone moves LEFT
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 
 local okVIM, VIM = pcall(function()
@@ -16,32 +16,51 @@ end
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
-pcall(function()
-	RunService:UnbindFromRenderStep("ZoneFollowFish") -- leftover from older versions
-end)
-
--- state
-local autoOn = false
+-- settings / toggles
+local holdOn = false
+local castOn = false
+local hookOn = false
 local debugOn = false
-local spyOn = false
-local invert = false -- turn on if holding moves the zone LEFT
+local discoveryOn = false
 local inputMethod = "Mouse"
 local deadband = 12 -- px
-local ctrlConn = nil
+local castDelay = 2 -- seconds to wait after a catch before casting again
+local castHoldMs = 100 -- how long the cast tap is held
+local hookDelayMs = 150 -- reaction delay before hooking
+local biteTimeout = 25 -- seconds to wait for a bite before recasting
+local HOOK_TIMEOUT = 6 -- seconds to wait for the reel bar after hooking
+
+-- state
+local alive = true
+local conn = nil
+local listeners = {}
 local holding = false
+local pulsing = false
 local inputBroken = false
-local hookInstalled = false
 local lane, zone, fish = nil, nil, nil
-local fishingRemote = nil
 local wasFound = false
 local errWarned = false
 local lastFishX, lastMove, lastDbg = nil, 0, 0
+local state = "IDLE" -- IDLE, WAIT_BITE, HOOKED, REELING
+local stateTime = os.clock()
+local lastReelEnd = os.clock()
+local lastHook = 0
+local biteFlag = false
+local discoveryCount = 0
 local TOUCH_ID = 1
 
 local function dbg(...)
 	if debugOn then
 		print("[ReelHelper]", ...)
 	end
+end
+
+local function setState(s)
+	if state ~= s then
+		dbg("state:", state, "->", s)
+	end
+	state = s
+	stateTime = os.clock()
 end
 
 local function getPath(root, ...)
@@ -84,20 +103,6 @@ local function resolve()
 	return false
 end
 
-local function getFishingRemote()
-	if fishingRemote and fishingRemote.Parent then
-		return fishingRemote
-	end
-	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-	local r = remotes and remotes:FindFirstChild("Fishing")
-	if r and r:IsA("RemoteEvent") then
-		fishingRemote = r
-		return r
-	end
-	fishingRemote = nil
-	return nil
-end
-
 -- true only if the gui and everything above it is actually visible
 local function isShown(gui)
 	local cur = gui
@@ -113,16 +118,7 @@ local function isShown(gui)
 	return true
 end
 
-local function guiInZone()
-	if not resolve() then
-		return nil
-	end
-	local fishCenter = fish.AbsolutePosition.X + fish.AbsoluteSize.X / 2
-	local zl = zone.AbsolutePosition.X
-	return fishCenter >= zl and fishCenter <= zl + zone.AbsoluteSize.X
-end
-
--- ===== input (hold / release) =====
+-- ===== input (hold / release / tap) =====
 
 local function tapPos()
 	local cam = workspace.CurrentCamera
@@ -130,8 +126,8 @@ local function tapPos()
 	return vp.X * 0.5, vp.Y * 0.4
 end
 
-local function setHold(state)
-	if holding == state then
+local function setHold(s)
+	if holding == s then
 		return
 	end
 	if inputBroken then
@@ -146,15 +142,15 @@ local function setHold(state)
 	local x, y = tapPos()
 	local ok, err = pcall(function()
 		if inputMethod == "Touch" then
-			VIM:SendTouchEvent(TOUCH_ID, state and 0 or 2, x, y)
+			VIM:SendTouchEvent(TOUCH_ID, s and 0 or 2, x, y)
 		else
-			VIM:SendMouseButtonEvent(x, y, 0, state, game, 0)
+			VIM:SendMouseButtonEvent(x, y, 0, s, game, 0)
 		end
 	end)
 
 	if ok then
-		holding = state
-		dbg(state and "HOLD" or "RELEASE")
+		holding = s
+		dbg(s and "HOLD" or "RELEASE")
 	else
 		inputBroken = true
 		warn("[ReelHelper] input failed (" .. inputMethod .. "):", err)
@@ -162,33 +158,50 @@ local function setHold(state)
 	end
 end
 
--- ===== controller =====
-
-local function ctrlStep()
-	if not resolve() or not isShown(lane) or lane.AbsoluteSize.X <= 0 then
+local function releaseHold()
+	if not pulsing then
 		setHold(false)
+	end
+end
+
+-- one tap (press, wait, release) without blocking the main loop
+local function pulse(ms)
+	if pulsing or not alive then
 		return
 	end
+	pulsing = true
+	task.spawn(function()
+		setHold(true)
+		task.wait(ms / 1000)
+		setHold(false)
+		pulsing = false
+	end)
+end
 
-	local now = os.clock()
+-- ===== reel detection + auto hold =====
 
-	-- only act while the fish is actually moving (so we don't click while idle)
+-- reel bar showing AND the fish is actually moving
+local function reelActive(now)
+	if not resolve() or not isShown(lane) or lane.AbsoluteSize.X <= 0 then
+		lastFishX = nil
+		return false
+	end
 	local fishX = fish.AbsolutePosition.X
 	if lastFishX == nil or math.abs(fishX - lastFishX) > 0.5 then
 		lastMove = now
 	end
 	lastFishX = fishX
-	if now - lastMove > 0.75 then
-		setHold(false)
+	return (now - lastMove) <= 0.75
+end
+
+local function holdLogic(now)
+	if pulsing then
 		return
 	end
 
-	local fishC = fishX + fish.AbsoluteSize.X / 2
+	local fishC = fish.AbsolutePosition.X + fish.AbsoluteSize.X / 2
 	local zoneC = zone.AbsolutePosition.X + zone.AbsoluteSize.X / 2
 	local err = fishC - zoneC
-	if invert then
-		err = -err
-	end
 
 	if err > deadband then
 		setHold(true)
@@ -202,81 +215,188 @@ local function ctrlStep()
 	end
 end
 
+-- ===== bite ("!") detection =====
+
+local function looksLikeBite(inst)
+	local ok, res = pcall(function()
+		local n = string.lower(inst.Name)
+		if n == "!" or n:find("exclam", 1, true) or n:find("bite", 1, true) or n:find("alert", 1, true)
+			or n:find("nibble", 1, true) or n:find("strike", 1, true) then
+			return true
+		end
+		if inst:IsA("TextLabel") or inst:IsA("TextButton") then
+			local t = string.gsub(inst.Text, "%s", "")
+			if t == "!" then
+				return true
+			end
+		end
+		return false
+	end)
+	return ok and res == true
+end
+
+local function onAdded(inst)
+	if not alive then
+		return
+	end
+
+	if discoveryOn and state ~= "REELING" and discoveryCount < 80 then
+		discoveryCount += 1
+		local txt = ""
+		pcall(function()
+			if inst:IsA("TextLabel") or inst:IsA("TextButton") then
+				txt = inst.Text
+			end
+		end)
+		print("[Discovery]", state, inst.ClassName, inst:GetFullName(), txt)
+	end
+
+	if looksLikeBite(inst) then
+		biteFlag = true
+		dbg("bite signal:", inst:GetFullName())
+	end
+end
+
+local function scanBite()
+	print("[ReelHelper] ---- bite scan (do this while the ! is on screen) ----")
+	local found = 0
+	local function check(root)
+		if not root then
+			return
+		end
+		for _, d in ipairs(root:GetDescendants()) do
+			if found >= 40 then
+				return
+			end
+			local hit = false
+			if looksLikeBite(d) then
+				hit = true
+			elseif d:IsA("BillboardGui") and d.Enabled then
+				hit = true
+			end
+			if hit then
+				found += 1
+				local extra = ""
+				if d:IsA("GuiObject") then
+					extra = "Visible=" .. tostring(d.Visible)
+				elseif d:IsA("BillboardGui") then
+					extra = "Enabled=" .. tostring(d.Enabled)
+				end
+				print(d.ClassName, d:GetFullName(), extra)
+			end
+		end
+	end
+	check(LocalPlayer:FindFirstChild("PlayerGui"))
+	check(workspace)
+	print("[ReelHelper] scan done, hits:", found)
+end
+
+local function connectListeners()
+	local pg = LocalPlayer:FindFirstChild("PlayerGui")
+	if pg then
+		listeners[#listeners + 1] = pg.DescendantAdded:Connect(onAdded)
+	end
+	listeners[#listeners + 1] = workspace.DescendantAdded:Connect(onAdded)
+end
+
+-- ===== main loop (state machine) =====
+
+local function step()
+	local now = os.clock()
+	local active = reelActive(now)
+
+	-- auto hold
+	if holdOn and active then
+		holdLogic(now)
+	else
+		releaseHold()
+	end
+
+	-- reeling: nothing else to do
+	if active then
+		if state ~= "REELING" then
+			setState("REELING")
+			biteFlag = false
+			discoveryCount = 0
+		end
+		return
+	end
+
+	-- reel just ended
+	if state == "REELING" then
+		lastReelEnd = now
+		setState("IDLE")
+		return
+	end
+
+	-- bite signal -> hook
+	if biteFlag then
+		biteFlag = false
+		local accept = hookOn
+			and (state == "WAIT_BITE" or (state == "IDLE" and not castOn))
+			and (now - lastHook > 2)
+		if accept then
+			lastHook = now
+			dbg("hooking in", hookDelayMs, "ms")
+			task.delay(hookDelayMs / 1000, function()
+				if alive then
+					pulse(80)
+				end
+			end)
+			setState("HOOKED")
+		end
+	end
+
+	if state == "IDLE" then
+		if castOn and not pulsing and now - lastReelEnd >= castDelay then
+			dbg("casting")
+			pulse(castHoldMs)
+			setState("WAIT_BITE")
+			biteFlag = false
+			discoveryCount = 0
+		end
+	elseif state == "WAIT_BITE" then
+		if now - stateTime > biteTimeout then
+			dbg("no bite in time, resetting")
+			lastReelEnd = now
+			setState("IDLE")
+		end
+	elseif state == "HOOKED" then
+		if now - stateTime > HOOK_TIMEOUT then
+			dbg("reel bar never showed, resetting")
+			lastReelEnd = now
+			setState("IDLE")
+		end
+	end
+end
+
 local function onHeartbeat()
-	local ok, err = pcall(ctrlStep)
+	local ok, err = pcall(step)
 	if not ok and not errWarned then
 		errWarned = true
 		warn("[ReelHelper] error:", err)
 	end
 end
 
-local function startCtrl()
-	if ctrlConn then
+local function startLoop()
+	if conn then
 		return
 	end
-	inputBroken = false
-	ctrlConn = RunService.Heartbeat:Connect(onHeartbeat)
-	dbg("auto-hold started")
+	conn = RunService.Heartbeat:Connect(onHeartbeat)
 end
 
-local function stopCtrl()
-	if ctrlConn then
-		ctrlConn:Disconnect()
-		ctrlConn = nil
+local function cleanup()
+	alive = false
+	holdOn, castOn, hookOn = false, false, false
+	if conn then
+		conn:Disconnect()
+		conn = nil
 	end
+	for _, c in ipairs(listeners) do
+		c:Disconnect()
+	end
+	listeners = {}
 	setHold(false)
-	dbg("auto-hold stopped")
-end
-
--- ===== fishing remote spy (finder) =====
-
-local function fmtArgs(...)
-	local packed = table.pack(...)
-	local out = {}
-	for i = 1, math.min(packed.n, 6) do
-		local v = packed[i]
-		local ok, s = pcall(tostring, v)
-		out[#out + 1] = typeof(v) .. ":" .. (ok and s or "?")
-	end
-	return table.concat(out, ", ")
-end
-
-local function installSpyHook()
-	if hookInstalled then
-		return true
-	end
-	if not (hookmetamethod and getnamecallmethod) then
-		warn("[ReelHelper] your executor has no hookmetamethod/getnamecallmethod, spy not available")
-		return false
-	end
-
-	local wrap = newcclosure or function(f)
-		return f
-	end
-
-	local ok, err = pcall(function()
-		local old
-		old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-			local method = getnamecallmethod()
-			if spyOn and method == "FireServer" and self == fishingRemote then
-				local args = fmtArgs(...)
-				local inZone = nil
-				pcall(function()
-					inZone = guiInZone()
-				end)
-				print("[Spy] Fishing:", args, "| GUI says fish in zone:", tostring(inZone))
-			end
-			return old(self, ...)
-		end))
-	end)
-
-	if not ok then
-		warn("[ReelHelper] hook failed:", err)
-		return false
-	end
-
-	hookInstalled = true
-	return true
 end
 
 -- ===== UI =====
@@ -284,33 +404,44 @@ end
 local Window = Rayfield:CreateWindow({
 	Name = "Reel Helper",
 	LoadingTitle = "Reel Helper",
-	LoadingSubtitle = "auto-hold follows fish",
+	LoadingSubtitle = "auto cast / hook / hold",
 	ConfigurationSaving = { Enabled = false },
 	KeySystem = false,
 })
 
-local Tab = Window:CreateTab("Reel", 4483362458)
+local Tab = Window:CreateTab("Fishing", 4483362458)
 
 Tab:CreateToggle({
-	Name = "Auto-hold (keeps zone on fish)",
+	Name = "Auto hold",
 	CurrentValue = false,
 	Flag = "AutoHold",
 	Callback = function(value)
-		autoOn = value
-		if value then
-			startCtrl()
-		else
-			stopCtrl()
+		holdOn = value
+		if not value then
+			releaseHold()
 		end
 	end,
 })
 
 Tab:CreateToggle({
-	Name = "Invert (holding moves zone LEFT)",
+	Name = "Auto cast",
 	CurrentValue = false,
-	Flag = "InvertHold",
+	Flag = "AutoCast",
 	Callback = function(value)
-		invert = value
+		castOn = value
+		if value then
+			lastReelEnd = os.clock()
+			setState("IDLE")
+		end
+	end,
+})
+
+Tab:CreateToggle({
+	Name = "Auto hook (tap when ! shows)",
+	CurrentValue = false,
+	Flag = "AutoHook",
+	Callback = function(value)
+		hookOn = value
 	end,
 })
 
@@ -343,7 +474,59 @@ Tab:CreateSlider({
 	end,
 })
 
-Tab:CreateToggle({
+local TimingTab = Window:CreateTab("Timing", 4483362458)
+
+TimingTab:CreateSlider({
+	Name = "Cast delay after catch (s)",
+	Range = { 0.5, 10 },
+	Increment = 0.5,
+	Suffix = "s",
+	CurrentValue = 2,
+	Flag = "CastDelay",
+	Callback = function(value)
+		castDelay = value
+	end,
+})
+
+TimingTab:CreateSlider({
+	Name = "Cast tap length (ms)",
+	Range = { 20, 1500 },
+	Increment = 10,
+	Suffix = "ms",
+	CurrentValue = 100,
+	Flag = "CastHoldMs",
+	Callback = function(value)
+		castHoldMs = value
+	end,
+})
+
+TimingTab:CreateSlider({
+	Name = "Hook reaction delay (ms)",
+	Range = { 0, 1000 },
+	Increment = 10,
+	Suffix = "ms",
+	CurrentValue = 150,
+	Flag = "HookDelayMs",
+	Callback = function(value)
+		hookDelayMs = value
+	end,
+})
+
+TimingTab:CreateSlider({
+	Name = "Bite timeout (s)",
+	Range = { 5, 60 },
+	Increment = 1,
+	Suffix = "s",
+	CurrentValue = 25,
+	Flag = "BiteTimeout",
+	Callback = function(value)
+		biteTimeout = value
+	end,
+})
+
+local FinderTab = Window:CreateTab("Finder", 4483362458)
+
+FinderTab:CreateToggle({
 	Name = "Debug messages",
 	CurrentValue = false,
 	Flag = "ReelDebug",
@@ -352,49 +535,28 @@ Tab:CreateToggle({
 	end,
 })
 
-local FinderTab = Window:CreateTab("Finder", 4483362458)
-
 FinderTab:CreateToggle({
-	Name = "Fishing remote spy",
+	Name = "Discovery log (prints new objects while waiting)",
 	CurrentValue = false,
-	Flag = "ReelSpy",
+	Flag = "ReelDiscovery",
 	Callback = function(value)
-		if value then
-			if not getFishingRemote() then
-				warn("[ReelHelper] couldn't find ReplicatedStorage.Remotes.Fishing")
-			end
-			if installSpyHook() then
-				spyOn = true
-				print("[ReelHelper] spy ON, go reel a fish")
-			else
-				spyOn = false
-			end
-		else
-			spyOn = false
-			print("[ReelHelper] spy OFF")
-		end
+		discoveryOn = value
+		discoveryCount = 0
 	end,
 })
 
 FinderTab:CreateButton({
-	Name = "Print status",
-	Callback = function()
-		local found = resolve()
-		print("[ReelHelper] auto:", autoOn, "| invert:", invert, "| input:", inputMethod, "| broken:", inputBroken, "| gui found:", found)
-		if found then
-			print("Zone:", zone.ClassName, zone.Position, zone.AbsoluteSize)
-			print("Fish:", fish.ClassName, fish.Position, fish.AbsoluteSize)
-			print("GUI says fish in zone:", tostring(guiInZone()))
-		end
-	end,
+	Name = "Scan for ! icon (press while it's showing)",
+	Callback = scanBite,
 })
 
 FinderTab:CreateButton({
 	Name = "Unload script",
 	Callback = function()
-		autoOn = false
-		spyOn = false -- hook can't be removed, but it just passes calls through when off
-		stopCtrl()
+		cleanup()
 		Rayfield:Destroy()
 	end,
 })
+
+connectListeners()
+startLoop()
