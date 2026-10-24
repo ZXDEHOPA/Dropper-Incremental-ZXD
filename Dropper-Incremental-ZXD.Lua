@@ -1,7 +1,8 @@
--- Reel Helper (Rayfield): Auto hold + Coins (pull to me) + Coin Challenge start
+-- Reel Helper (Rayfield): Auto Fish + Coins (region resize / pull) + Auto Challenge Coin
 -- Reel GUI: PlayerGui > Front > MainFrame > ReelBar > Track > Lane > (Zone, Fish)
 -- Coins:    workspace > MapEssentials > Spawned > Number (MeshPart, positioned with CFrame)
--- Challenge: ReplicatedStorage > Remotes > Challenge:FireServer("CoinCollector", "Start")
+-- Region:   workspace > MapEssentials > Collection > SpawnableRegion (set to 100, 20, 100 while Auto collect is on)
+-- Challenge: ReplicatedStorage > Remotes > Challenge:FireServer("CoinCollector", "Start") (spammed every 100ms)
 -- Game behavior while reeling: hold = zone moves RIGHT, release = zone moves LEFT
 
 local Players = game:GetService("Players")
@@ -18,15 +19,21 @@ end
 
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
+-- size the spawn region gets while Auto collect coins is ON (change it here if you want)
+local REGION_SIZE = Vector3.new(100, 20, 100)
+
+-- how often the challenge Start call is sent (seconds)
+local CHALLENGE_INTERVAL = 0.1
+
 -- ===== shared state =====
 local alive = true
 local debugOn = false
 local conn = nil
 local errWarned = false
 
--- auto hold
+-- auto fish
 local autoOn = false
-local inputMethod = "Mouse"
+local inputMethod = "Touch"
 local deadband = 12 -- px
 local holding = false
 local inputBroken = false
@@ -39,7 +46,6 @@ local TOUCH_ID = 1
 -- coins
 local collectOn = false
 local returnOn = true
-local autoStartChallenge = false
 local coinMethod = "Pull" -- "Pull", "Teleport" or "Touch"
 local delaySec = 0.15
 local pullInterval = 0.1
@@ -51,6 +57,16 @@ local touchWarned = false
 local missingWarned = false
 local attempts = setmetatable({}, { __mode = "k" })
 local blacklist = setmetatable({}, { __mode = "k" })
+
+-- challenge spam
+local challengeOn = false
+local challengeRunId = 0
+local challengeWarned = false
+
+-- spawn region
+local regionRef = nil
+local regionOrigSize = nil
+local regionWarned = false
 
 local function dbg(...)
 	if debugOn then
@@ -174,7 +190,7 @@ local function setHold(state)
 	end
 end
 
--- ===== auto hold logic =====
+-- ===== auto fish logic =====
 
 local function holdLogic(now)
 	local fishC = fish.AbsolutePosition.X + fish.AbsoluteSize.X / 2
@@ -193,26 +209,101 @@ local function holdLogic(now)
 	end
 end
 
--- ===== coin challenge =====
+-- ===== challenge spam =====
 
-local function startChallenge()
+local function getChallengeRemote()
 	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
 	local ev = remotes and remotes:FindFirstChild("Challenge")
-	if not ev or not ev:IsA("RemoteEvent") then
-		warn("[ReelHelper] couldn't find ReplicatedStorage.Remotes.Challenge")
-		return false
+	if ev and ev:IsA("RemoteEvent") then
+		return ev
 	end
+	return nil
+end
 
-	local ok, err = pcall(function()
-		ev:FireServer("CoinCollector", "Start")
+local function startChallengeLoop()
+	challengeRunId += 1
+	local myId = challengeRunId
+
+	task.spawn(function()
+		local ev = nil
+
+		while alive and challengeOn and challengeRunId == myId do
+			if not ev or not ev.Parent then
+				ev = getChallengeRemote()
+			end
+
+			if ev then
+				local ok, err = pcall(function()
+					ev:FireServer("CoinCollector", "Start")
+				end)
+				if ok then
+					challengeWarned = false
+				elseif not challengeWarned then
+					challengeWarned = true
+					warn("[ReelHelper] challenge start failed:", err)
+				end
+			elseif not challengeWarned then
+				challengeWarned = true
+				warn("[ReelHelper] couldn't find ReplicatedStorage.Remotes.Challenge")
+			end
+
+			task.wait(CHALLENGE_INTERVAL)
+		end
 	end)
 
-	if ok then
-		print("[ReelHelper] sent CoinCollector Start")
-	else
-		warn("[ReelHelper] challenge start failed:", err)
+	dbg("auto challenge started")
+end
+
+local function stopChallengeLoop()
+	challengeRunId += 1 -- ends any running challenge loop
+	dbg("auto challenge stopped")
+end
+
+-- ===== spawn region size =====
+
+local function getRegion()
+	if regionRef and regionRef.Parent then
+		return regionRef
 	end
-	return ok
+	local r = getPath(workspace, "MapEssentials", "Collection", "SpawnableRegion")
+	if r and r:IsA("BasePart") then
+		return r
+	end
+	return nil
+end
+
+-- sets the region to REGION_SIZE (and keeps it there if the game changes it back)
+local function applyRegionSize()
+	local r = getRegion()
+	if not r then
+		if not regionWarned then
+			regionWarned = true
+			warn("[ReelHelper] couldn't find workspace.MapEssentials.Collection.SpawnableRegion")
+		end
+		return
+	end
+	regionWarned = false
+
+	if regionRef ~= r then
+		regionRef = r
+		regionOrigSize = r.Size
+		print("[ReelHelper] SpawnableRegion size was", tostring(regionOrigSize), "-> setting to", tostring(REGION_SIZE))
+	end
+
+	if r.Size ~= REGION_SIZE then
+		r.Size = REGION_SIZE
+	end
+end
+
+local function restoreRegionSize()
+	if regionRef and regionRef.Parent and regionOrigSize then
+		pcall(function()
+			regionRef.Size = regionOrigSize
+		end)
+		dbg("spawn region size restored to", tostring(regionOrigSize))
+	end
+	regionRef = nil
+	regionOrigSize = nil
 end
 
 -- ===== coins =====
@@ -397,8 +488,11 @@ local function step()
 		setHold(false)
 	end
 
-	if collectOn and coinMethod == "Pull" then
-		pullCoins(now)
+	if collectOn then
+		applyRegionSize() -- keeps the region at REGION_SIZE while Auto collect is on
+		if coinMethod == "Pull" then
+			pullCoins(now)
+		end
 	end
 end
 
@@ -416,11 +510,14 @@ local function cleanup()
 	alive = false
 	autoOn = false
 	collectOn = false
+	challengeOn = false
 	stopCollect()
+	stopChallengeLoop()
 	if conn then
 		conn:Disconnect()
 		conn = nil
 	end
+	restoreRegionSize()
 	setHold(false)
 end
 
@@ -429,38 +526,31 @@ end
 local Window = Rayfield:CreateWindow({
 	Name = "Reel Helper",
 	LoadingTitle = "Reel Helper",
-	LoadingSubtitle = "auto hold + coins",
+	LoadingSubtitle = "auto fish + coins",
 	ConfigurationSaving = { Enabled = false },
 	KeySystem = false,
 })
 
+-- Fishing tab
 local FishTab = Window:CreateTab("Fishing", 4483362458)
 
-FishTab:CreateButton({
-	Name = "Unload script",
-	Callback = function()
-		cleanup()
-		Rayfield:Destroy()
-	end,
-})
-
 FishTab:CreateToggle({
-	Name = "Auto hold",
+	Name = "Auto Fish",
 	CurrentValue = false,
-	Flag = "AutoHold",
+	Flag = "AutoFish",
 	Callback = function(value)
 		autoOn = value
 		if not value then
 			setHold(false)
 		end
-		dbg("auto hold:", value)
+		dbg("auto fish:", value)
 	end,
 })
 
 FishTab:CreateDropdown({
 	Name = "Input method",
-	Options = { "Mouse", "Touch" },
-	CurrentOption = { "Mouse" },
+	Options = { "Touch", "Mouse" },
+	CurrentOption = { "Touch" },
 	MultipleOptions = false,
 	Flag = "InputMethod",
 	Callback = function(option)
@@ -486,23 +576,8 @@ FishTab:CreateSlider({
 	end,
 })
 
-FishTab:CreateToggle({
-	Name = "Debug messages (everything)",
-	CurrentValue = false,
-	Flag = "ReelDebug",
-	Callback = function(value)
-		debugOn = value
-	end,
-})
-
+-- Coins tab
 local CoinTab = Window:CreateTab("Coins", 4483362458)
-
-CoinTab:CreateButton({
-	Name = "Start Coin Challenge",
-	Callback = function()
-		startChallenge()
-	end,
-})
 
 CoinTab:CreateToggle({
 	Name = "Auto collect coins",
@@ -511,22 +586,26 @@ CoinTab:CreateToggle({
 	Callback = function(value)
 		collectOn = value
 		if value then
-			if autoStartChallenge then
-				startChallenge()
-			end
+			pcall(applyRegionSize) -- resize the spawn region right away
 			startCollect()
 		else
 			stopCollect()
+			restoreRegionSize()
 		end
 	end,
 })
 
 CoinTab:CreateToggle({
-	Name = "Start challenge when auto collect turns on",
+	Name = "Auto Challenge Coin",
 	CurrentValue = false,
-	Flag = "AutoStartChallenge",
+	Flag = "AutoChallengeCoin",
 	Callback = function(value)
-		autoStartChallenge = value
+		challengeOn = value
+		if value then
+			startChallengeLoop()
+		else
+			stopChallengeLoop()
+		end
 	end,
 })
 
@@ -619,5 +698,56 @@ CoinTab:CreateButton({
 	end,
 })
 
--- start the main loop (reel detection, auto hold, coin pulling)
+CoinTab:CreateButton({
+	Name = "Print Collection info",
+	Callback = function()
+		local me = workspace:FindFirstChild("MapEssentials")
+		if not me then
+			print("[ReelHelper] MapEssentials not found")
+			return
+		end
+		print("[ReelHelper] ---- MapEssentials ----")
+		for _, c in ipairs(me:GetChildren()) do
+			print("  ", c.ClassName, c.Name, "children:", #c:GetChildren())
+		end
+		local col = me:FindFirstChild("Collection")
+		if col then
+			print("[ReelHelper] ---- Collection ----")
+			for i, c in ipairs(col:GetChildren()) do
+				if i > 20 then
+					break
+				end
+				local extra = ""
+				if c:IsA("BasePart") then
+					extra = "size " .. tostring(c.Size) .. " pos " .. tostring(c.Position)
+				end
+				print("  ", c.ClassName, c.Name, extra)
+			end
+		else
+			print("[ReelHelper] Collection not found")
+		end
+	end,
+})
+
+-- Settings tab
+local SettingsTab = Window:CreateTab("Settings", 4483362458)
+
+SettingsTab:CreateToggle({
+	Name = "Debug messages (everything)",
+	CurrentValue = false,
+	Flag = "ReelDebug",
+	Callback = function(value)
+		debugOn = value
+	end,
+})
+
+SettingsTab:CreateButton({
+	Name = "Unload script",
+	Callback = function()
+		cleanup()
+		Rayfield:Destroy()
+	end,
+})
+
+-- start the main loop (reel detection, auto fish, region size, coin pulling)
 conn = RunService.Heartbeat:Connect(onHeartbeat)
