@@ -1,3 +1,5 @@
+-- Made by ZXD --
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -75,7 +77,8 @@ local clickLoops = {
 -- merchant (all 3 slots selected by default)
 local merchantOn = false
 local merchantRunId = 0
-local merchantInterval = 0.25
+local merchantInterval = 0.25 -- wait after a full pass over the slots
+local merchantSlotGap = 0.4 -- wait between each slot buy (so the server doesn't drop them)
 local merchantSlots = { "Slot1", "Slot2", "Slot3" }
 local merchantWarned = false
 
@@ -307,15 +310,21 @@ local function startMerchantLoop()
 					if not (alive and merchantOn and merchantRunId == myId) then
 						break
 					end
+
 					local ok, err = pcall(function()
 						ev:FireServer("Buy", slot)
 					end)
+					dbg("merchant buy", slot, ok and "sent" or "failed")
+
 					if ok then
 						merchantWarned = false
 					elseif not merchantWarned then
 						merchantWarned = true
 						warn("[ReelHelper] merchant buy failed:", err)
 					end
+
+					-- wait between slots so the server doesn't drop Slot 2 / Slot 3
+					task.wait(merchantSlotGap)
 				end
 			elseif not merchantWarned then
 				merchantWarned = true
@@ -333,6 +342,28 @@ local function stopMerchantLoop()
 	merchantOn = false
 	merchantRunId += 1 -- ends any running merchant loop
 	dbg("auto buy merchant stopped")
+end
+
+-- fires Slot1, Slot2, Slot3 once each (1 second apart) and prints what happened
+local function testBuySlots()
+	task.spawn(function()
+		local ev = getRemote("Merchant")
+		if not ev then
+			warn("[ReelHelper] couldn't find ReplicatedStorage.Remotes.Merchant")
+			return
+		end
+
+		for _, slot in ipairs({ "Slot1", "Slot2", "Slot3" }) do
+			if not alive then
+				return
+			end
+			local ok, err = pcall(function()
+				ev:FireServer("Buy", slot)
+			end)
+			print("[ReelHelper] test buy", slot, ok and "sent" or ("failed: " .. tostring(err)))
+			task.wait(1)
+		end
+	end)
 end
 
 -- ===== challenge spam =====
@@ -1000,6 +1031,18 @@ MiscTab:CreateDropdown({
 })
 
 MiscTab:CreateSlider({
+	Name = "Merchant slot gap (s)",
+	Range = { 0.05, 3 },
+	Increment = 0.05,
+	Suffix = "s",
+	CurrentValue = 0.4,
+	Flag = "MerchantSlotGap",
+	Callback = function(value)
+		merchantSlotGap = value
+	end,
+})
+
+MiscTab:CreateSlider({
 	Name = "Merchant delay (s)",
 	Range = { 0.05, 5 },
 	Increment = 0.05,
@@ -1009,6 +1052,11 @@ MiscTab:CreateSlider({
 	Callback = function(value)
 		merchantInterval = value
 	end,
+})
+
+MiscTab:CreateButton({
+	Name = "Test buy slots (1, 2, 3)",
+	Callback = testBuySlots,
 })
 
 -- Tab 5: Settings (last)
