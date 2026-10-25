@@ -1,13 +1,3 @@
--- Reel Helper (Rayfield): Auto Click + Coins + Auto Fish + Speedrun
--- Tabs: Auto Click, Coins, Fishing, Settings, Speedrun
--- Reel GUI: PlayerGui > Front > MainFrame > ReelBar > Track > Lane > (Zone, Fish)
--- Coins:    workspace > MapEssentials > Spawned > Number (MeshPart, positioned with CFrame)
--- Region:   workspace > MapEssentials > Collection > SpawnableRegion (set to 100, 20, 100 while Auto collect is on)
--- Challenge: ReplicatedStorage > Remotes > Challenge:FireServer("CoinCollector", "Start") (spammed every 100ms)
--- Remote spam loops (all :FireServer() with no args), in ReplicatedStorage > Remotes:
---   DropperClick, BronzeDropperClick, MobAttackMlt (Auto Fighting), TreeHit (Auto Logging), Ascend (Auto Ascend)
--- Game behavior while reeling: hold = zone moves RIGHT, release = zone moves LEFT
-
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -71,7 +61,7 @@ local regionRef = nil
 local regionOrigSize = nil
 local regionWarned = false
 
--- remote spam loops (Auto Click tab + Speedrun tab)
+-- remote spam loops (Auto Click tab + Misc tab)
 -- a loop with its own "interval" uses that, otherwise it uses the shared clickInterval
 local clickInterval = 0.1
 local clickLoops = {
@@ -81,6 +71,13 @@ local clickLoops = {
 	TreeHit = { on = false, id = 0, warned = false },
 	Ascend = { on = false, id = 0, warned = false, interval = 0.1 },
 }
+
+-- merchant (all 3 slots selected by default)
+local merchantOn = false
+local merchantRunId = 0
+local merchantInterval = 0.25
+local merchantSlots = { "Slot1", "Slot2", "Slot3" }
+local merchantWarned = false
 
 local function dbg(...)
 	if debugOn then
@@ -282,6 +279,60 @@ local function stopClickLoop(name)
 	st.on = false
 	st.id += 1 -- ends any running loop for this remote
 	dbg(name, "loop stopped")
+end
+
+-- ===== merchant =====
+
+local function startMerchantLoop()
+	if merchantOn then
+		return -- already running
+	end
+
+	merchantOn = true
+	merchantRunId += 1
+	local myId = merchantRunId
+
+	task.spawn(function()
+		local ev = nil
+
+		while alive and merchantOn and merchantRunId == myId do
+			if not ev or not ev.Parent then
+				ev = getRemote("Merchant")
+			end
+
+			if ev then
+				-- copy the list so changing the dropdown mid-loop can't break the pass
+				local slots = table.clone(merchantSlots)
+				for _, slot in ipairs(slots) do
+					if not (alive and merchantOn and merchantRunId == myId) then
+						break
+					end
+					local ok, err = pcall(function()
+						ev:FireServer("Buy", slot)
+					end)
+					if ok then
+						merchantWarned = false
+					elseif not merchantWarned then
+						merchantWarned = true
+						warn("[ReelHelper] merchant buy failed:", err)
+					end
+				end
+			elseif not merchantWarned then
+				merchantWarned = true
+				warn("[ReelHelper] couldn't find ReplicatedStorage.Remotes.Merchant")
+			end
+
+			task.wait(merchantInterval)
+		end
+	end)
+
+	dbg("auto buy merchant started")
+end
+
+local function stopMerchantLoop()
+	merchantOn = false
+	merchantRunId += 1 -- ends any running merchant loop
+	dbg("auto buy merchant stopped")
 end
 
 -- ===== challenge spam =====
@@ -588,6 +639,7 @@ local function cleanup()
 	challengeOn = false
 	stopCollect()
 	stopChallengeLoop()
+	stopMerchantLoop()
 	for name in pairs(clickLoops) do
 		stopClickLoop(name)
 	end
@@ -874,7 +926,92 @@ FishTab:CreateSlider({
 	end,
 })
 
--- Tab 4: Settings
+-- Tab 4: Misc (above Settings)
+local MiscTab = Window:CreateTab("Misc", 4483362458)
+
+MiscTab:CreateSection("Speedrun")
+
+MiscTab:CreateToggle({
+	Name = "Auto Ascend",
+	CurrentValue = false,
+	Flag = "AutoAscend",
+	Callback = function(value)
+		if value then
+			startClickLoop("Ascend")
+		else
+			stopClickLoop("Ascend")
+		end
+	end,
+})
+
+MiscTab:CreateSlider({
+	Name = "Ascend delay (s)",
+	Range = { 0.03, 1 },
+	Increment = 0.01,
+	Suffix = "s",
+	CurrentValue = 0.1,
+	Flag = "AscendDelay",
+	Callback = function(value)
+		clickLoops.Ascend.interval = value
+	end,
+})
+
+MiscTab:CreateSection("Merchant")
+
+MiscTab:CreateToggle({
+	Name = "Auto Buy Merchant",
+	CurrentValue = true, -- ON by default
+	Flag = "AutoBuyMerchant",
+	Callback = function(value)
+		if value then
+			startMerchantLoop()
+		else
+			stopMerchantLoop()
+		end
+	end,
+})
+
+MiscTab:CreateDropdown({
+	Name = "Merchant slots",
+	Options = { "Slot 1", "Slot 2", "Slot 3" },
+	CurrentOption = { "Slot 1", "Slot 2", "Slot 3" }, -- all selected by default
+	MultipleOptions = true,
+	Flag = "MerchantSlots",
+	Callback = function(options)
+		local list = {}
+		if type(options) == "table" then
+			for _, v in ipairs(options) do
+				if type(v) == "string" then
+					local n = v:match("Slot%s*(%d+)")
+					if n then
+						list[#list + 1] = "Slot" .. n
+					end
+				end
+			end
+		elseif type(options) == "string" then
+			local n = options:match("Slot%s*(%d+)")
+			if n then
+				list[1] = "Slot" .. n
+			end
+		end
+		merchantSlots = list
+		dbg("merchant slots:", table.concat(list, ", "))
+	end,
+})
+
+MiscTab:CreateSlider({
+	Name = "Merchant delay (s)",
+	Range = { 0.05, 5 },
+	Increment = 0.05,
+	Suffix = "s",
+	CurrentValue = 0.25,
+	Flag = "MerchantDelay",
+	Callback = function(value)
+		merchantInterval = value
+	end,
+})
+
+-- Tab 5: Settings (last)
 local SettingsTab = Window:CreateTab("Settings", 4483362458)
 
 SettingsTab:CreateToggle({
@@ -894,33 +1031,9 @@ SettingsTab:CreateButton({
 	end,
 })
 
--- Tab 5: Speedrun (after Settings)
-local SpeedTab = Window:CreateTab("Speedrun", 4483362458)
-
-SpeedTab:CreateToggle({
-	Name = "Auto Ascend",
-	CurrentValue = false,
-	Flag = "AutoAscend",
-	Callback = function(value)
-		if value then
-			startClickLoop("Ascend")
-		else
-			stopClickLoop("Ascend")
-		end
-	end,
-})
-
-SpeedTab:CreateSlider({
-	Name = "Ascend delay (s)",
-	Range = { 0.03, 1 },
-	Increment = 0.01,
-	Suffix = "s",
-	CurrentValue = 0.1,
-	Flag = "AscendDelay",
-	Callback = function(value)
-		clickLoops.Ascend.interval = value
-	end,
-})
+-- Auto Buy Merchant is ON by default, so start it now
+-- (startMerchantLoop does nothing if the toggle callback already started it)
+startMerchantLoop()
 
 -- start the main loop (reel detection, auto fish, region size, coin pulling)
 conn = RunService.Heartbeat:Connect(onHeartbeat)
