@@ -1,11 +1,11 @@
--- Reel Helper (Rayfield): Auto Click + Coins + Auto Fish
--- Tabs: Auto Click, Coins, Fishing, Settings
+-- Reel Helper (Rayfield): Auto Click + Coins + Auto Fish + Speedrun
+-- Tabs: Auto Click, Coins, Fishing, Settings, Speedrun
 -- Reel GUI: PlayerGui > Front > MainFrame > ReelBar > Track > Lane > (Zone, Fish)
 -- Coins:    workspace > MapEssentials > Spawned > Number (MeshPart, positioned with CFrame)
 -- Region:   workspace > MapEssentials > Collection > SpawnableRegion (set to 100, 20, 100 while Auto collect is on)
 -- Challenge: ReplicatedStorage > Remotes > Challenge:FireServer("CoinCollector", "Start") (spammed every 100ms)
--- Auto Click remotes (all :FireServer() with no args), in ReplicatedStorage > Remotes:
---   DropperClick, BronzeDropperClick, MobAttackMlt (Auto Fighting), TreeHit (Auto Logging)
+-- Remote spam loops (all :FireServer() with no args), in ReplicatedStorage > Remotes:
+--   DropperClick, BronzeDropperClick, MobAttackMlt (Auto Fighting), TreeHit (Auto Logging), Ascend (Auto Ascend)
 -- Game behavior while reeling: hold = zone moves RIGHT, release = zone moves LEFT
 
 local Players = game:GetService("Players")
@@ -71,13 +71,15 @@ local regionRef = nil
 local regionOrigSize = nil
 local regionWarned = false
 
--- auto click (remote spam loops)
+-- remote spam loops (Auto Click tab + Speedrun tab)
+-- a loop with its own "interval" uses that, otherwise it uses the shared clickInterval
 local clickInterval = 0.1
 local clickLoops = {
 	DropperClick = { on = false, id = 0, warned = false },
 	BronzeDropperClick = { on = false, id = 0, warned = false },
 	MobAttackMlt = { on = false, id = 0, warned = false },
 	TreeHit = { on = false, id = 0, warned = false },
+	Ascend = { on = false, id = 0, warned = false, interval = 0.1 },
 }
 
 local function dbg(...)
@@ -221,7 +223,7 @@ local function holdLogic(now)
 	end
 end
 
--- ===== auto click (remote spam loops) =====
+-- ===== remote spam loops =====
 
 local function getRemote(name)
 	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
@@ -265,7 +267,7 @@ local function startClickLoop(name)
 				warn("[ReelHelper] couldn't find ReplicatedStorage.Remotes." .. name)
 			end
 
-			task.wait(clickInterval)
+			task.wait(st.interval or clickInterval)
 		end
 	end)
 
@@ -827,7 +829,7 @@ CoinTab:CreateButton({
 	end,
 })
 
--- Tab 3: Fishing (second to last)
+-- Tab 3: Fishing
 local FishTab = Window:CreateTab("Fishing", 4483362458)
 
 FishTab:CreateToggle({
@@ -872,7 +874,7 @@ FishTab:CreateSlider({
 	end,
 })
 
--- Tab 4: Settings (last)
+-- Tab 4: Settings
 local SettingsTab = Window:CreateTab("Settings", 4483362458)
 
 SettingsTab:CreateToggle({
@@ -889,6 +891,34 @@ SettingsTab:CreateButton({
 	Callback = function()
 		cleanup()
 		Rayfield:Destroy()
+	end,
+})
+
+-- Tab 5: Speedrun (after Settings)
+local SpeedTab = Window:CreateTab("Speedrun", 4483362458)
+
+SpeedTab:CreateToggle({
+	Name = "Auto Ascend",
+	CurrentValue = false,
+	Flag = "AutoAscend",
+	Callback = function(value)
+		if value then
+			startClickLoop("Ascend")
+		else
+			stopClickLoop("Ascend")
+		end
+	end,
+})
+
+SpeedTab:CreateSlider({
+	Name = "Ascend delay (s)",
+	Range = { 0.03, 1 },
+	Increment = 0.01,
+	Suffix = "s",
+	CurrentValue = 0.1,
+	Flag = "AscendDelay",
+	Callback = function(value)
+		clickLoops.Ascend.interval = value
 	end,
 })
 
