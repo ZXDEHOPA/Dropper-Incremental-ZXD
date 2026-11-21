@@ -47,6 +47,10 @@ local autoHoldHolding = false
 local autoHoldBroken = false
 local AUTOHOLD_TOUCH_ID = 2 -- different id than Auto Fish so they don't collide
 
+-- auto kite (Auto Click tab): holds the kite button through the Kite remote
+local kiteOn = false
+local kiteWarned = false
+
 -- coins
 local collectOn = false
 local returnOn = true
@@ -375,6 +379,46 @@ local function stopClickLoop(name)
 	st.on = false
 	st.id += 1 -- ends any running loop for this remote
 	dbg(name, "loop stopped")
+end
+
+-- ===== auto kite (hold forever) =====
+
+-- sends Kite("Hold", true/false), returns true if it was sent
+local function sendKite(state)
+	local ev = getRemote("Kite")
+	if not ev then
+		if not kiteWarned then
+			kiteWarned = true
+			warn("[ReelHelper] couldn't find ReplicatedStorage.Remotes.Kite")
+		end
+		return false
+	end
+
+	local ok, err = pcall(function()
+		ev:FireServer("Hold", state)
+	end)
+
+	if ok then
+		kiteWarned = false
+		dbg("kite hold:", state)
+	elseif not kiteWarned then
+		kiteWarned = true
+		warn("[ReelHelper] kite hold failed:", err)
+	end
+	return ok
+end
+
+local function startKite()
+	kiteOn = true
+	sendKite(true) -- sent once, the game keeps the hold until we release
+end
+
+local function stopKite()
+	local wasOn = kiteOn
+	kiteOn = false
+	if wasOn then
+		sendKite(false) -- always let go so you're never stuck holding
+	end
 end
 
 -- ===== merchant =====
@@ -763,6 +807,7 @@ local function cleanup()
 	collectOn = false
 	challengeOn = false
 	stopAutoHold()
+	stopKite() -- sends the release if the kite was being held
 	stopCollect()
 	stopChallengeLoop()
 	stopMerchantLoop()
@@ -832,6 +877,19 @@ ClickTab:CreateSlider({
 	Flag = "AutoHoldDelay",
 	Callback = function(value)
 		autoHoldDelay = value
+	end,
+})
+
+ClickTab:CreateToggle({
+	Name = "Auto Kite",
+	CurrentValue = false,
+	Flag = "AutoKite",
+	Callback = function(value)
+		if value then
+			startKite()
+		else
+			stopKite()
+		end
 	end,
 })
 
