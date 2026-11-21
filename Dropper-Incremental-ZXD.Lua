@@ -38,6 +38,15 @@ local lastFishX, lastMove, lastDbg = nil, 0, 0
 local reelBusy = false -- true while the reel minigame is running
 local TOUCH_ID = 1
 
+-- auto hold (Auto Click tab): holds the input, and every "delay" seconds does a quick click
+local autoHoldOn = false
+local autoHoldInput = "Touch" -- "Touch" or "Click"
+local autoHoldDelay = 60 -- seconds between quick clicks
+local autoHoldRunId = 0
+local autoHoldHolding = false
+local autoHoldBroken = false
+local AUTOHOLD_TOUCH_ID = 2 -- different id than Auto Fish so they don't collide
+
 -- coins
 local collectOn = false
 local returnOn = true
@@ -223,6 +232,88 @@ local function holdLogic(now)
 		lastDbg = now
 		print(string.format("[ReelHelper] fish %.0f | zone %.0f | err %.0f | holding %s", fishC, zoneC, err, tostring(holding)))
 	end
+end
+
+-- ===== auto hold (Auto Click tab) =====
+
+-- sends one press (down = true) or release (down = false), returns true if it worked
+local function autoHoldSend(down)
+	if autoHoldBroken then
+		return false
+	end
+	if not VIM then
+		autoHoldBroken = true
+		warn("[ReelHelper] VirtualInputManager not available in your executor")
+		return false
+	end
+
+	local x, y = tapPos()
+	local ok, err = pcall(function()
+		if autoHoldInput == "Touch" then
+			VIM:SendTouchEvent(AUTOHOLD_TOUCH_ID, down and 0 or 2, x, y)
+		else
+			VIM:SendMouseButtonEvent(x, y, 0, down, game, 0)
+		end
+	end)
+
+	if not ok then
+		autoHoldBroken = true
+		warn("[ReelHelper] auto hold input failed (" .. autoHoldInput .. "):", err)
+		warn("[ReelHelper] try the other input in the dropdown")
+		return false
+	end
+	return true
+end
+
+local function autoHoldSet(state)
+	if autoHoldHolding == state then
+		return
+	end
+	if autoHoldSend(state) then
+		autoHoldHolding = state
+		dbg("auto hold:", state and "HOLD" or "RELEASE")
+	end
+end
+
+local function startAutoHold()
+	autoHoldRunId += 1
+	local myId = autoHoldRunId
+	autoHoldBroken = false
+
+	task.spawn(function()
+		local lastClick = os.clock()
+
+		while alive and autoHoldOn and autoHoldRunId == myId do
+			if reelBusy then
+				-- let the reel bar have the input while you're reeling
+				autoHoldSet(false)
+				lastClick = os.clock()
+			else
+				if os.clock() - lastClick >= autoHoldDelay then
+					-- quick click: let go, click, then hold again
+					autoHoldSet(false)
+					task.wait(0.05)
+					autoHoldSend(true)
+					task.wait(0.05)
+					autoHoldSend(false)
+					task.wait(0.05)
+					lastClick = os.clock()
+					dbg("auto hold: quick click")
+				end
+				autoHoldSet(true)
+			end
+
+			task.wait(0.1)
+		end
+	end)
+
+	dbg("auto hold started")
+end
+
+local function stopAutoHold()
+	autoHoldRunId += 1 -- ends any running auto hold loop
+	autoHoldSet(false) -- let go right away
+	dbg("auto hold stopped")
 end
 
 -- ===== remote spam loops =====
@@ -668,8 +759,10 @@ end
 local function cleanup()
 	alive = false
 	autoOn = false
+	autoHoldOn = false
 	collectOn = false
 	challengeOn = false
+	stopAutoHold()
 	stopCollect()
 	stopChallengeLoop()
 	stopMerchantLoop()
@@ -696,6 +789,53 @@ local Window = Rayfield:CreateWindow({
 
 -- Tab 1: Auto Click
 local ClickTab = Window:CreateTab("Auto Click", 4483362458)
+
+ClickTab:CreateSection("Holders")
+
+ClickTab:CreateToggle({
+	Name = "Auto Hold",
+	CurrentValue = false,
+	Flag = "AutoHold",
+	Callback = function(value)
+		autoHoldOn = value
+		if value then
+			startAutoHold()
+		else
+			stopAutoHold()
+		end
+	end,
+})
+
+ClickTab:CreateDropdown({
+	Name = "Input",
+	Options = { "Touch", "Click" },
+	CurrentOption = { "Touch" }, -- default is Touch (mobile)
+	MultipleOptions = false,
+	Flag = "AutoHoldInput",
+	Callback = function(option)
+		local v = type(option) == "table" and option[1] or option
+		if v == "Touch" or v == "Click" then
+			autoHoldSet(false) -- let go with the old input first
+			autoHoldInput = v
+			autoHoldBroken = false
+			dbg("auto hold input:", v)
+		end
+	end,
+})
+
+ClickTab:CreateSlider({
+	Name = "Delay (sec)",
+	Range = { 1, 300 },
+	Increment = 1,
+	Suffix = "sec",
+	CurrentValue = 60,
+	Flag = "AutoHoldDelay",
+	Callback = function(value)
+		autoHoldDelay = value
+	end,
+})
+
+ClickTab:CreateSection("Clickers")
 
 ClickTab:CreateToggle({
 	Name = "Auto Dropper",
