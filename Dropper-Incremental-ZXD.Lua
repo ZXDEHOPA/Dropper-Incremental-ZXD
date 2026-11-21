@@ -3,6 +3,7 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local GuiService = game:GetService("GuiService")
 local LocalPlayer = Players.LocalPlayer
 
 local okVIM, VIM = pcall(function()
@@ -38,7 +39,7 @@ local lastFishX, lastMove, lastDbg = nil, 0, 0
 local reelBusy = false -- true while the reel minigame is running
 local TOUCH_ID = 1
 
--- auto hold (Auto Click tab): holds the input, and every "delay" seconds does a quick click
+-- auto pulls debris (Auto Click tab): holds the input, and every "delay" seconds does a quick click
 local autoHoldOn = false
 local autoHoldInput = "Touch" -- "Touch" or "Click"
 local autoHoldDelay = 60 -- seconds between quick clicks
@@ -50,6 +51,19 @@ local AUTOHOLD_TOUCH_ID = 2 -- different id than Auto Fish so they don't collide
 -- auto kite (Auto Click tab): holds the kite button through the Kite remote
 local kiteOn = false
 local kiteWarned = false
+
+-- auto golden circle (kite minigame): clicks when the Ring shrinks to the gold size
+local goldenOn = false
+local goldenInput = "Touch" -- "Touch" or "Click"
+local goldenSize = 60 -- Ring AbsoluteSize where it turns gold
+local goldenEarly = 3 -- click this many px before the gold size (covers input delay)
+local ringRef = nil
+local lastRingSearch = 0
+local goldenArmed = true
+local goldenClicking = false
+local goldenWarned = false
+local lastGoldenDbg = 0
+local GOLDEN_TOUCH_ID = 3
 
 -- coins
 local collectOn = false
@@ -160,6 +174,9 @@ local function isShown(gui)
 		if cur:IsA("ScreenGui") and not cur.Enabled then
 			return false
 		end
+		if (cur:IsA("BillboardGui") or cur:IsA("SurfaceGui")) and not cur.Enabled then
+			return false
+		end
 		cur = cur.Parent
 	end
 	return true
@@ -238,7 +255,7 @@ local function holdLogic(now)
 	end
 end
 
--- ===== auto hold (Auto Click tab) =====
+-- ===== auto pulls debris (Auto Click tab) =====
 
 -- sends one press (down = true) or release (down = false), returns true if it worked
 local function autoHoldSend(down)
@@ -262,7 +279,7 @@ local function autoHoldSend(down)
 
 	if not ok then
 		autoHoldBroken = true
-		warn("[ReelHelper] auto hold input failed (" .. autoHoldInput .. "):", err)
+		warn("[ReelHelper] auto pulls debris input failed (" .. autoHoldInput .. "):", err)
 		warn("[ReelHelper] try the other input in the dropdown")
 		return false
 	end
@@ -275,7 +292,7 @@ local function autoHoldSet(state)
 	end
 	if autoHoldSend(state) then
 		autoHoldHolding = state
-		dbg("auto hold:", state and "HOLD" or "RELEASE")
+		dbg("auto pulls debris:", state and "HOLD" or "RELEASE")
 	end
 end
 
@@ -302,7 +319,7 @@ local function startAutoHold()
 					autoHoldSend(false)
 					task.wait(0.05)
 					lastClick = os.clock()
-					dbg("auto hold: quick click")
+					dbg("auto pulls debris: quick click")
 				end
 				autoHoldSet(true)
 			end
@@ -311,13 +328,13 @@ local function startAutoHold()
 		end
 	end)
 
-	dbg("auto hold started")
+	dbg("auto pulls debris started")
 end
 
 local function stopAutoHold()
-	autoHoldRunId += 1 -- ends any running auto hold loop
+	autoHoldRunId += 1 -- ends any running loop
 	autoHoldSet(false) -- let go right away
-	dbg("auto hold stopped")
+	dbg("auto pulls debris stopped")
 end
 
 -- ===== remote spam loops =====
@@ -335,6 +352,9 @@ local function startClickLoop(name)
 	local st = clickLoops[name]
 	if not st then
 		return
+	end
+	if st.on then
+		return -- already running (the toggle callback and the default-on start can both call this)
 	end
 
 	st.on = true
@@ -419,6 +439,189 @@ local function stopKite()
 	if wasOn then
 		sendKite(false) -- always let go so you're never stuck holding
 	end
+end
+
+-- ===== auto golden circle (kite minigame) =====
+
+-- finds Worlds > (any world) > KiteClient > Kite_<number> > Ring
+local function findKiteRing()
+	if ringRef and ringRef.Parent then
+		return ringRef
+	end
+	ringRef = nil
+
+	-- don't search every frame
+	local now = os.clock()
+	if now - lastRingSearch < 0.25 then
+		return nil
+	end
+	lastRingSearch = now
+
+	local kiteClient = nil
+	for _, root in ipairs({ workspace, ReplicatedStorage }) do
+		local worlds = root:FindFirstChild("Worlds")
+		if worlds then
+			for _, world in ipairs(worlds:GetChildren()) do
+				local kc = world:FindFirstChild("KiteClient")
+				if kc then
+					kiteClient = kc
+					break
+				end
+			end
+		end
+		if kiteClient then
+			break
+		end
+	end
+
+	if not kiteClient then
+		return nil
+	end
+
+	for _, k in ipairs(kiteClient:GetChildren()) do
+		if k.Name:match("^Kite_%d+$") then
+			local r = k:FindFirstChild("Ring", true)
+			if r then
+				ringRef = r
+				dbg("found kite ring:", r:GetFullName(), r.ClassName)
+				return r
+			end
+		end
+	end
+
+	return nil
+end
+
+local function goldenReadSize(ring)
+	local ok, size = pcall(function()
+		return ring.AbsoluteSize
+	end)
+	if ok and typeof(size) == "Vector2" then
+		return size.X
+	end
+	return nil
+end
+
+-- taps the ring's center if it's normal on-screen UI, otherwise the screen center
+local function goldenTapPos(ring)
+	local ok, x, y = pcall(function()
+		local gui = ring:FindFirstAncestorOfClass("ScreenGui")
+		if gui and ring:IsA("GuiObject") then
+			local pos = ring.AbsolutePosition
+			local size = ring.AbsoluteSize
+			local inset = gui.IgnoreGuiInset and Vector2.zero or GuiService:GetGuiInset()
+			return pos.X + size.X / 2 + inset.X, pos.Y + size.Y / 2 + inset.Y
+		end
+		return nil, nil
+	end)
+
+	if ok and x and y then
+		return x, y
+	end
+	return tapPos()
+end
+
+-- one quick tap (press, short wait, release) without blocking the main loop
+local function goldenClick(x, y)
+	if goldenClicking then
+		return
+	end
+	if not VIM then
+		if not goldenWarned then
+			goldenWarned = true
+			warn("[ReelHelper] VirtualInputManager not available in your executor")
+		end
+		return
+	end
+
+	goldenClicking = true
+	task.spawn(function()
+		local ok, err = pcall(function()
+			if goldenInput == "Touch" then
+				VIM:SendTouchEvent(GOLDEN_TOUCH_ID, 0, x, y)
+			else
+				VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+			end
+		end)
+		if not ok and not goldenWarned then
+			goldenWarned = true
+			warn("[ReelHelper] golden circle click failed (" .. goldenInput .. "):", err)
+			warn("[ReelHelper] try the other input in the dropdown")
+		end
+
+		task.wait(0.04)
+
+		pcall(function()
+			if goldenInput == "Touch" then
+				VIM:SendTouchEvent(GOLDEN_TOUCH_ID, 2, x, y)
+			else
+				VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+			end
+		end)
+
+		goldenClicking = false
+	end)
+end
+
+local function goldenStep(now)
+	local ring = findKiteRing()
+	if not ring or not isShown(ring) then
+		goldenArmed = true
+		return
+	end
+
+	local size = goldenReadSize(ring)
+	if not size then
+		if not goldenWarned then
+			goldenWarned = true
+			warn("[ReelHelper] kite Ring has no AbsoluteSize, can't read it")
+		end
+		return
+	end
+
+	if size <= 1 then
+		goldenArmed = true
+		return
+	end
+
+	if debugOn and now - lastGoldenDbg > 0.1 then
+		lastGoldenDbg = now
+		local colorText = "?"
+		pcall(function()
+			if ring:IsA("ImageLabel") or ring:IsA("ImageButton") then
+				colorText = tostring(ring.ImageColor3)
+			else
+				colorText = tostring(ring.BackgroundColor3)
+			end
+		end)
+		print(string.format("[ReelHelper] ring size %.1f | color %s | armed %s", size, colorText, tostring(goldenArmed)))
+	end
+
+	local trigger = goldenSize + goldenEarly
+
+	-- a big ring means a new circle started, so get ready to click again
+	if size > trigger + 20 then
+		goldenArmed = true
+	end
+
+	-- click once when the ring shrinks into the gold size (never before)
+	if goldenArmed and size <= trigger and size >= goldenSize - 25 then
+		goldenArmed = false
+		local x, y = goldenTapPos(ring)
+		dbg(string.format("golden circle: clicking at ring size %.1f", size))
+		goldenClick(x, y)
+	end
+end
+
+local function startGolden()
+	goldenOn = true
+	goldenArmed = true
+	dbg("auto golden circle started")
+end
+
+local function stopGolden()
+	goldenOn = false
+	dbg("auto golden circle stopped")
 end
 
 -- ===== merchant =====
@@ -782,6 +985,10 @@ local function step()
 		setHold(false)
 	end
 
+	if goldenOn then
+		goldenStep(now)
+	end
+
 	if collectOn then
 		applyRegionSize() -- keeps the region at REGION_SIZE while Auto collect is on
 		if coinMethod == "Pull" then
@@ -804,6 +1011,7 @@ local function cleanup()
 	alive = false
 	autoOn = false
 	autoHoldOn = false
+	goldenOn = false
 	collectOn = false
 	challengeOn = false
 	stopAutoHold()
@@ -825,9 +1033,9 @@ end
 -- ===== UI =====
 
 local Window = Rayfield:CreateWindow({
-	Name = "Reel Helper",
-	LoadingTitle = "Reel Helper",
-	LoadingSubtitle = "auto click + coins + auto fish",
+	Name = "Dropper Incremental",
+	LoadingTitle = "Dropper Incremental",
+	LoadingSubtitle = "Readying up your Clickers...",
 	ConfigurationSaving = { Enabled = false },
 	KeySystem = false,
 })
@@ -838,9 +1046,9 @@ local ClickTab = Window:CreateTab("Auto Click", 4483362458)
 ClickTab:CreateSection("Holders")
 
 ClickTab:CreateToggle({
-	Name = "Auto Hold",
+	Name = "Auto Pulls Debris",
 	CurrentValue = false,
-	Flag = "AutoHold",
+	Flag = "AutoPullsDebris",
 	Callback = function(value)
 		autoHoldOn = value
 		if value then
@@ -863,7 +1071,7 @@ ClickTab:CreateDropdown({
 			autoHoldSet(false) -- let go with the old input first
 			autoHoldInput = v
 			autoHoldBroken = false
-			dbg("auto hold input:", v)
+			dbg("auto pulls debris input:", v)
 		end
 	end,
 })
@@ -893,11 +1101,64 @@ ClickTab:CreateToggle({
 	end,
 })
 
+ClickTab:CreateToggle({
+	Name = "Auto Golden Circle",
+	CurrentValue = true, -- ON by default
+	Flag = "AutoGoldenCircle",
+	Callback = function(value)
+		if value then
+			startGolden()
+		else
+			stopGolden()
+		end
+	end,
+})
+
+ClickTab:CreateDropdown({
+	Name = "Circle input",
+	Options = { "Touch", "Click" },
+	CurrentOption = { "Touch" }, -- default is Touch (mobile)
+	MultipleOptions = false,
+	Flag = "GoldenInput",
+	Callback = function(option)
+		local v = type(option) == "table" and option[1] or option
+		if v == "Touch" or v == "Click" then
+			goldenInput = v
+			goldenWarned = false
+			dbg("golden circle input:", v)
+		end
+	end,
+})
+
+ClickTab:CreateSlider({
+	Name = "Golden size (px)",
+	Range = { 20, 200 },
+	Increment = 1,
+	Suffix = "px",
+	CurrentValue = 60,
+	Flag = "GoldenSize",
+	Callback = function(value)
+		goldenSize = value
+	end,
+})
+
+ClickTab:CreateSlider({
+	Name = "Click early by (px)",
+	Range = { 0, 20 },
+	Increment = 1,
+	Suffix = "px",
+	CurrentValue = 3,
+	Flag = "GoldenEarly",
+	Callback = function(value)
+		goldenEarly = value
+	end,
+})
+
 ClickTab:CreateSection("Clickers")
 
 ClickTab:CreateToggle({
 	Name = "Auto Dropper",
-	CurrentValue = false,
+	CurrentValue = true, -- ON by default
 	Flag = "AutoDropper",
 	Callback = function(value)
 		if value then
@@ -910,7 +1171,7 @@ ClickTab:CreateToggle({
 
 ClickTab:CreateToggle({
 	Name = "Auto Bronze Dropper",
-	CurrentValue = false,
+	CurrentValue = true, -- ON by default
 	Flag = "AutoBronzeDropper",
 	Callback = function(value)
 		if value then
@@ -1292,9 +1553,12 @@ SettingsTab:CreateButton({
 	end,
 })
 
--- Auto Buy Merchant is ON by default, so start it now
--- (startMerchantLoop does nothing if the toggle callback already started it)
+-- Things that are ON by default get started right now
+-- (each start function does nothing if the toggle callback already started it)
+startClickLoop("DropperClick")
+startClickLoop("BronzeDropperClick")
+startGolden()
 startMerchantLoop()
 
--- start the main loop (reel detection, auto fish, region size, coin pulling)
+-- start the main loop (reel detection, auto fish, golden circle, region size, coin pulling)
 conn = RunService.Heartbeat:Connect(onHeartbeat)
