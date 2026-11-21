@@ -65,10 +65,12 @@ local regionWarned = false
 
 -- remote spam loops (Auto Click tab + Misc tab)
 -- a loop with its own "interval" uses that, otherwise it uses the shared clickInterval
+-- a loop with "args" sends those arguments with FireServer (otherwise it sends none)
 local clickInterval = 0.1
 local clickLoops = {
 	DropperClick = { on = false, id = 0, warned = false },
 	BronzeDropperClick = { on = false, id = 0, warned = false },
+	Windmill = { on = false, id = 0, warned = false, args = { "Push" } },
 	MobAttackMlt = { on = false, id = 0, warned = false },
 	TreeHit = { on = false, id = 0, warned = false },
 	Ascend = { on = false, id = 0, warned = false, interval = 0.1 },
@@ -254,7 +256,7 @@ local function startClickLoop(name)
 
 			if ev then
 				local ok, err = pcall(function()
-					ev:FireServer()
+					ev:FireServer(table.unpack(st.args or {}))
 				end)
 				if ok then
 					st.warned = false
@@ -717,6 +719,19 @@ ClickTab:CreateToggle({
 			startClickLoop("BronzeDropperClick")
 		else
 			stopClickLoop("BronzeDropperClick")
+		end
+	end,
+})
+
+ClickTab:CreateToggle({
+	Name = "Auto Windmill",
+	CurrentValue = false,
+	Flag = "AutoWindmill",
+	Callback = function(value)
+		if value then
+			startClickLoop("Windmill")
+		else
+			stopClickLoop("Windmill")
 		end
 	end,
 })
